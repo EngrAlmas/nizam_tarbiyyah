@@ -26,23 +26,142 @@ try:
 except ImportError:
     gcs_storage = None
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 app = FastAPI(
     title="نظام تربية الطلاب - Nizam Tarbiyyatud Dullab",
     description="مدرسة تربية الطلاب وتعليم القرآن (Unguwar Gwaza, Gusau, Zamfara State)",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 DB_FILE = os.environ.get("DB_FILE", "islamiyya_results.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+IS_POSTGRES = bool(
+    DATABASE_URL
+    and (
+        DATABASE_URL.startswith("postgres://")
+        or DATABASE_URL.startswith("postgresql://")
+    )
+)
+
 MASTER_STUDENTS_EXCEL = os.environ.get(
     "MASTER_STUDENTS_EXCEL", "students_master_database.xlsx"
 )
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
 
+DB_INTEGRITY_ERRORS = (
+    (sqlite3.IntegrityError, psycopg2.IntegrityError)
+    if psycopg2 is not None
+    else (sqlite3.IntegrityError,)
+)
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+
+def _normalize_pg_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+    if "sslmode=" not in url and "localhost" not in url and "127.0.0.1" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    return url
+
+
+def _translate_sql_for_pg(sql: str) -> str:
+    """Translates SQLite-flavored SQL (`?` placeholders & `INSERT OR IGNORE`) to PostgreSQL SQL."""
+    s = sql.strip()
+    if re.search(r"INSERT\s+OR\s+IGNORE\s+INTO", s, flags=re.IGNORECASE):
+        s = re.sub(
+            r"INSERT\s+OR\s+IGNORE\s+INTO",
+            "INSERT INTO",
+            s,
+            flags=re.IGNORECASE,
+        )
+        if "ON CONFLICT" not in s.upper():
+            s = s.rstrip(";").rstrip() + " ON CONFLICT DO NOTHING"
+    s = s.replace("?", "%s")
+    return s
+
+
+class DBCursor:
+    """Unified cursor adapter supporting both Cloud PostgreSQL (Neon/Supabase) and local SQLite."""
+
+    def __init__(self, raw_cursor, is_postgres: bool):
+        self._cur = raw_cursor
+        self.is_postgres = is_postgres
+
+    def execute(self, sql: str, params: tuple = ()):
+        if self.is_postgres:
+            sql = _translate_sql_for_pg(sql)
+        if params:
+            return self._cur.execute(sql, tuple(params))
+        return self._cur.execute(sql)
+
+    def executemany(self, sql: str, seq_of_params):
+        if self.is_postgres:
+            sql = _translate_sql_for_pg(sql)
+        return self._cur.executemany(sql, seq_of_params)
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cur, "lastrowid", None)
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+
+class DBConnection:
+    """Unified connection wrapper for PostgreSQL and SQLite."""
+
+    def __init__(self, raw_conn, is_postgres: bool):
+        self._conn = raw_conn
+        self.is_postgres = is_postgres
+
+    def cursor(self) -> DBCursor:
+        return DBCursor(self._conn.cursor(), self.is_postgres)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+
+def get_db_connection() -> DBConnection:
+    if IS_POSTGRES:
+        if psycopg2 is None:
+            raise RuntimeError(
+                "psycopg2-binary is required when DATABASE_URL is set."
+            )
+        pg_conn = psycopg2.connect(_normalize_pg_url(DATABASE_URL))
+        return DBConnection(pg_conn, is_postgres=True)
+    sq_conn = sqlite3.connect(DB_FILE)
+    sq_conn.execute("PRAGMA foreign_keys = ON")
+    return DBConnection(sq_conn, is_postgres=False)
+
+
+def insert_and_get_id(
+    cursor: DBCursor, sql: str, params: tuple = (), pk_col: str = "id"
+) -> int:
+    """Executes an INSERT statement and returns the newly generated primary key ID on both PG and SQLite."""
+    if cursor.is_postgres:
+        pg_sql = sql.strip().rstrip(";") + f" RETURNING {pk_col}"
+        cursor.execute(pg_sql, params)
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+    cursor.execute(sql, params)
+    return int(cursor.lastrowid)
 
 
 # ==========================================
@@ -75,6 +194,11 @@ def format_td_code(seq_number: int) -> str:
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    auto_pk = (
+        "SERIAL PRIMARY KEY"
+        if conn.is_postgres
+        else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    )
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS admin (
@@ -93,16 +217,16 @@ def init_db():
         )
     """)
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS classes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_pk},
             name TEXT UNIQUE NOT NULL
         )
     """)
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_pk},
             name_ar TEXT UNIQUE NOT NULL,
             name_en TEXT
         )
@@ -118,9 +242,9 @@ def init_db():
         )
     """)
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS teachers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_pk},
             full_name TEXT NOT NULL,
             ref_key TEXT UNIQUE NOT NULL
         )
@@ -138,9 +262,9 @@ def init_db():
         )
     """)
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS students (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_pk},
             student_code TEXT UNIQUE,
             full_name TEXT NOT NULL,
             class_id INTEGER,
@@ -149,13 +273,9 @@ def init_db():
         )
     """)
 
-    # Permanent Student Index Registry:
-    # Guarantees that once a TD index number is assigned to a student, it remains
-    # forever tied to that student's name and can NEVER be reused even if the student
-    # leaves the school or is deleted from active classes.
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS student_index_registry (
-            seq_num INTEGER PRIMARY KEY AUTOINCREMENT,
+            seq_num {auto_pk},
             student_code TEXT UNIQUE NOT NULL,
             student_id INTEGER,
             full_name TEXT NOT NULL,
@@ -178,18 +298,25 @@ def init_db():
         )
     """)
 
-    # Migrate existing `students` table if `student_code` or `status` columns were not present
-    cursor.execute("PRAGMA table_info(students)")
-    existing_cols = {row[1] for row in cursor.fetchall()}
-    if "student_code" not in existing_cols:
-        cursor.execute("ALTER TABLE students ADD COLUMN student_code TEXT")
+    if conn.is_postgres:
         cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_students_code ON students(student_code)"
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS student_code TEXT UNIQUE"
         )
-    if "status" not in existing_cols:
         cursor.execute(
-            "ALTER TABLE students ADD COLUMN status TEXT DEFAULT 'active'"
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'"
         )
+    else:
+        cursor.execute("PRAGMA table_info(students)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "student_code" not in existing_cols:
+            cursor.execute("ALTER TABLE students ADD COLUMN student_code TEXT")
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_students_code ON students(student_code)"
+            )
+        if "status" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE students ADD COLUMN status TEXT DEFAULT 'active'"
+            )
 
     # Default Admin
     cursor.execute(
@@ -818,8 +945,9 @@ def add_class(
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO classes (name) VALUES (?)", (clean_name,))
-        class_id = cursor.lastrowid
+        class_id = insert_and_get_id(
+            cursor, "INSERT INTO classes (name) VALUES (?)", (clean_name,)
+        )
         if subject_ids_json:
             try:
                 sids = json.loads(subject_ids_json)
@@ -831,7 +959,8 @@ def add_class(
             except Exception:
                 pass
         conn.commit()
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
+        conn.rollback()
         conn.close()
         raise HTTPException(status_code=400, detail="هذا الفصل موجود بالفعل")
     conn.close()
@@ -879,17 +1008,19 @@ def add_subject(name_ar: str = Form(...), name_en: str = Form("")):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute(
+        subject_id = insert_and_get_id(
+            cursor,
             "INSERT INTO subjects (name_ar, name_en) VALUES (?, ?)",
             (name_ar.strip(), name_en.strip()),
         )
         conn.commit()
         return {
             "status": "success",
-            "subject_id": cursor.lastrowid,
+            "subject_id": subject_id,
             "message": f"تمت إضافة المادة '{name_ar.strip()}' بنجاح",
         }
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
+        conn.rollback()
         raise HTTPException(status_code=400, detail="هذه المادة موجودة بالفعل")
     finally:
         conn.close()
@@ -1342,18 +1473,20 @@ def register_teacher(full_name: str = Form(...)):
     cursor = conn.cursor()
     ref_key = generate_ref_key(cursor)
     try:
-        cursor.execute(
+        teacher_id = insert_and_get_id(
+            cursor,
             "INSERT INTO teachers (full_name, ref_key) VALUES (?, ?)",
             (clean_name, ref_key),
         )
         conn.commit()
         return {
             "status": "success",
-            "teacher_id": cursor.lastrowid,
+            "teacher_id": teacher_id,
             "message": f"تم تسجيل المعلم {clean_name} بنجاح",
             "ref_key": ref_key,
         }
     except Exception as e:
+        conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
@@ -1608,11 +1741,11 @@ async def bulk_upload_teacher_assignments(
         # 1. Resolve or auto-create Teacher
         if t_name not in teacher_lookup:
             ref_key = generate_ref_key(cursor)
-            cursor.execute(
+            tid = insert_and_get_id(
+                cursor,
                 "INSERT INTO teachers (full_name, ref_key) VALUES (?, ?)",
                 (t_name, ref_key),
             )
-            tid = cursor.lastrowid
             teacher_lookup[t_name] = tid
             new_teachers_created += 1
         else:
